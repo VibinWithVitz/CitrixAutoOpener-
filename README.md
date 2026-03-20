@@ -1,0 +1,1 @@
+This is a script for Mac iOS that will open all relevant radiation oncology applications from SCMC. The user will still need to use their phone's 2FA. All passwords are stored securely using iOS' encrypted keychain. 
