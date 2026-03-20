@@ -175,11 +175,14 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW
                 <key>ActionParameters</key>
                 <dict>
                     <key>COMMAND_STRING</key>
-                    <string>python3 "${SCRIPT_DIR}/citrix_autologin.py"</string>
+                    <string>osascript -e 'tell application "Terminal"
+    activate
+    do script "python3 ${SCRIPT_DIR}/citrix_autologin.py"
+end tell'</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
                     <key>inputMethod</key>
-                    <integer>0</integer>
+                    <integer>1</integer>
                     <key>shell</key>
                     <string>/bin/bash</string>
                     <key>source</key>
@@ -221,6 +224,8 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW
     <dict/>
     <key>workflowMetaData</key>
     <dict>
+        <key>serviceInputTypeIdentifier</key>
+        <string>com.apple.Automator.nothing</string>
         <key>workflowTypeIdentifier</key>
         <string>com.apple.Automator.servicesMenu</string>
     </dict>
