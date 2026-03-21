@@ -157,7 +157,7 @@ def _run_flow(page, config, apps, log, headless):
     # --- Navigate to login page ---
     log.log(f"Opening {citrix_url}...")
     try:
-        page.goto(citrix_url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(citrix_url, wait_until="networkidle", timeout=30000)
     except PlaywrightTimeout:
         log.log("ERROR: Page load timed out.")
         log.save_screenshot(page)
@@ -184,6 +184,11 @@ def _run_flow(page, config, apps, log, headless):
 
     def fill_and_submit():
         page.wait_for_selector("#login", timeout=10000)
+        # Wait for Citrix jQuery/JS framework to finish initializing form handlers.
+        # Without this, fill() can fire before event handlers are bound, causing
+        # the values to be wiped or the submit to be ignored.
+        page.wait_for_load_state("networkidle")
+        time.sleep(1)
         page.fill("#login", "")
         page.fill("#login", username)
         page.fill("#passwd", "")
@@ -239,7 +244,8 @@ def _handle_pre_login_splash(page, log):
     Handle the "New Login Instructions" splash page if present.
 
     This page shares #loginBtn with the real Log On button. After clicking
-    Continue, we wait for the username field to confirm we reached the login form.
+    Continue, we wait for the page to fully navigate and the login form's
+    JS framework to initialize before proceeding.
     """
     try:
         log.log("Checking for 'New Login Instructions' splash page...")
@@ -247,6 +253,8 @@ def _handle_pre_login_splash(page, log):
         if header.count() > 0 and header.first.is_visible():
             log.log("Found splash page — clicking Continue...")
             page.click("#loginBtn")
+            # Wait for navigation to the login form page
+            page.wait_for_load_state("networkidle")
             page.wait_for_selector("#login", timeout=15000)
             log.log("Login page loaded.")
     except (PlaywrightTimeout, Exception):
