@@ -1,15 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# Citrix Auto-Login — Setup Script
+# Citrix Auto-Login v2 — Setup Script
 # =============================================================================
 # Run this ONCE to install everything the auto-login script needs.
 #
 # WHAT THIS SCRIPT DOES:
-# 1. Installs Homebrew (if not already installed) — macOS package manager
-# 2. Installs Python 3 (if not already installed)
-# 3. Installs ChromeDriver (the Selenium-to-Chrome bridge)
-# 4. Installs the Python packages we need (selenium)
-# 5. Stores your Citrix credentials in macOS Keychain
+# 1. Checks for Python 3 (does NOT auto-install — your IT may restrict this)
+# 2. Installs the Python packages we need (playwright, pyyaml)
+# 3. Downloads the Playwright Chromium browser
+# 4. Stores your Citrix credentials in macOS Keychain
+# 5. Generates your config file (~/.citrix-autologin.yaml)
 # 6. Creates a keyboard shortcut via an Automator Quick Action
 #
 # HOW TO RUN:
@@ -20,57 +20,52 @@
 set -e  # Exit immediately if any command fails
 
 echo "========================================="
-echo "  Citrix Auto-Login — Setup"
+echo "  Citrix Auto-Login v2 — Setup"
 echo "========================================="
 echo ""
 
-# ---- Step 1: Homebrew ----
-# Homebrew is the standard package manager for macOS. It lets you install
-# command-line tools and applications from the terminal.
-echo "Step 1: Checking for Homebrew..."
-if ! command -v brew &> /dev/null; then
-    echo "  Homebrew not found. Installing..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add Homebrew to PATH for Apple Silicon Macs
-    if [[ $(uname -m) == "arm64" ]]; then
-        echo '  eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    fi
-else
-    echo "  Homebrew is already installed. ✓"
-fi
-
-# ---- Step 2: Python 3 ----
-echo ""
-echo "Step 2: Checking for Python 3..."
+# ---- Step 1: Python 3 ----
+echo "Step 1: Checking for Python 3..."
 if ! command -v python3 &> /dev/null; then
-    echo "  Installing Python 3 via Homebrew..."
-    brew install python3
+    echo ""
+    echo "  ERROR: Python 3 not found."
+    echo "  Install from https://www.python.org/downloads/ or ask IT to install it."
+    exit 1
 else
-    echo "  Python 3 is already installed. ✓"
+    PYVER=$(python3 --version 2>&1)
+    echo "  $PYVER ✓"
 fi
 
-# ---- Step 3: ChromeDriver ----
-# ChromeDriver is a separate program that Selenium uses to control Chrome.
-# It must match your installed Chrome version (roughly).
+# ---- Step 2: Python packages ----
 echo ""
-echo "Step 3: Installing ChromeDriver..."
-brew install --cask chromedriver 2>/dev/null || echo "  (chromedriver may already be installed)"
+echo "Step 2: Installing Python packages..."
+if pip3 install --user playwright pyyaml 2>/dev/null; then
+    echo "  Python packages installed. ✓"
+else
+    echo ""
+    echo "  pip install failed. If you see 'externally managed environment', try:"
+    echo "    pip3 install --break-system-packages playwright pyyaml"
+    echo ""
+    echo "  Then re-run this setup script."
+    exit 1
+fi
 
-# On first run, macOS may block chromedriver. This removes the quarantine flag.
-echo "  Removing macOS quarantine flag from chromedriver..."
-xattr -d com.apple.quarantine $(which chromedriver) 2>/dev/null || true
-echo "  ChromeDriver ready. ✓"
-
-# ---- Step 4: Python packages ----
+# ---- Step 3: Playwright Chromium ----
 echo ""
-echo "Step 4: Installing Python packages..."
-pip3 install selenium
-echo "  Python packages installed. ✓"
+echo "Step 3: Downloading Playwright Chromium browser..."
+if python3 -m playwright install chromium 2>/dev/null; then
+    echo "  Chromium downloaded. ✓"
+else
+    echo ""
+    echo "  Chromium download failed."
+    echo "  Check your network connection or proxy settings."
+    echo "  You can retry with: python3 -m playwright install chromium"
+    exit 1
+fi
 
-# ---- Step 5: Store credentials in Keychain ----
+# ---- Step 4: Store credentials in Keychain ----
 echo ""
-echo "Step 5: Storing your Citrix credentials in macOS Keychain..."
+echo "Step 4: Storing your Citrix credentials in macOS Keychain..."
 echo "  (Your password will be stored encrypted, not in plain text)"
 echo ""
 read -p "  Enter your Citrix username: " citrix_user
@@ -81,11 +76,62 @@ echo ""
 security delete-generic-password -s "citrix-autologin" 2>/dev/null || true
 
 # Add the new entry
-# -a = account (username)
-# -s = service name (our label to find it later)
-# -w = password
 security add-generic-password -a "$citrix_user" -s "citrix-autologin" -w "$citrix_pass"
 echo "  Credentials stored in Keychain. ✓"
+
+# ---- Step 5: Generate config file ----
+echo ""
+echo "Step 5: Generating config file..."
+
+CONFIG_FILE="$HOME/.citrix-autologin.yaml"
+
+if [ -f "$CONFIG_FILE" ]; then
+    read -p "  Config already exists at $CONFIG_FILE. Overwrite? [y/N] " overwrite
+    if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+        echo "  Keeping existing config. ✓"
+        SKIP_CONFIG=true
+    fi
+fi
+
+if [ -z "$SKIP_CONFIG" ]; then
+    read -p "  Enter your Citrix login URL [https://gateway.scmc.org/]: " citrix_url
+    citrix_url=${citrix_url:-https://gateway.scmc.org/}
+
+    read -p "  Which apps to launch? (comma-separated) [Epic Production, Aria Home, MIM, RayStation 2024A SP3]: " apps_input
+    apps_input=${apps_input:-"Epic Production, Aria Home, MIM, RayStation 2024A SP3"}
+
+    # Convert comma-separated string to YAML list
+    cat > "$CONFIG_FILE" << YAMLEOF
+# Citrix Auto-Login Configuration
+# Generated by setup.sh on $(date +%Y-%m-%d)
+
+citrix_url: "$citrix_url"
+push_approval_timeout: 120
+app_launch_delay: 3
+portal_load_wait: 3
+headless: false
+
+apps:
+YAMLEOF
+
+    # Parse comma-separated apps into YAML list items
+    IFS=',' read -ra APP_ARRAY <<< "$apps_input"
+    for app in "${APP_ARRAY[@]}"; do
+        # Trim whitespace
+        app=$(echo "$app" | xargs)
+        echo "  - \"$app\"" >> "$CONFIG_FILE"
+    done
+
+    echo "" >> "$CONFIG_FILE"
+    echo "# Optional: named profiles for different app sets" >> "$CONFIG_FILE"
+    echo "# profiles:" >> "$CONFIG_FILE"
+    echo "#   clinic:" >> "$CONFIG_FILE"
+    echo "#     apps: [\"Epic Production\", \"Aria Home\"]" >> "$CONFIG_FILE"
+    echo "#   planning:" >> "$CONFIG_FILE"
+    echo "#     apps: [\"MIM\", \"RayStation 2024A SP3\"]" >> "$CONFIG_FILE"
+
+    echo "  Config saved to $CONFIG_FILE ✓"
+fi
 
 # ---- Step 6: Create keyboard shortcut via Automator ----
 echo ""
@@ -94,14 +140,14 @@ echo "Step 6: Creating keyboard shortcut..."
 # Get the directory where this setup script lives
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Create an Automator Quick Action (workflow) that runs our Python script.
-# Quick Actions can be assigned keyboard shortcuts in System Settings.
+# Create an Automator Quick Action that runs the script silently
+# (no Terminal window — notifications provide all user feedback)
 WORKFLOW_DIR="$HOME/Library/Services/Citrix Auto-Login.workflow"
 CONTENTS_DIR="$WORKFLOW_DIR/Contents"
 
 mkdir -p "$CONTENTS_DIR"
 
-# The Info.plist tells Automator this is a "no input" service
+# Info.plist — tells Automator this is a "no input" service
 cat > "$CONTENTS_DIR/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -123,7 +169,7 @@ cat > "$CONTENTS_DIR/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-# The workflow document (what actually runs)
+# The workflow document — runs the script silently (no Terminal window)
 cat > "$CONTENTS_DIR/document.wflow" << WFLOW
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -158,7 +204,7 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW
                     <string>Automator</string>
                 </array>
                 <key>AMComment</key>
-                <string>Runs the Citrix auto-login Python script</string>
+                <string>Runs the Citrix auto-login Python script silently</string>
                 <key>AMProvides</key>
                 <dict>
                     <key>Container</key>
@@ -175,10 +221,7 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW
                 <key>ActionParameters</key>
                 <dict>
                     <key>COMMAND_STRING</key>
-                    <string>osascript -e 'tell application "Terminal"
-    activate
-    do script "python3 ${SCRIPT_DIR}/citrix_autologin.py"
-end tell'</string>
+                    <string>python3 -m citrix_autologin ${SCRIPT_DIR} &gt;/dev/null 2&gt;&amp;1 &amp;</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
                     <key>inputMethod</key>
@@ -236,26 +279,21 @@ WFLOW
 echo "  Automator Quick Action created. ✓"
 echo ""
 
-# ---- Step 7: Remind about permissions ----
+# ---- Done! ----
 echo "========================================="
 echo "  SETUP COMPLETE!"
 echo "========================================="
 echo ""
-echo "REMAINING MANUAL STEPS:"
+echo "ONE REMAINING STEP:"
 echo ""
-echo "1. SET UP KEYBOARD SHORTCUT:"
-echo "   → System Settings → Keyboard → Keyboard Shortcuts → Services"
-echo "   → Find 'Citrix Auto-Login' in the General section"
-echo "   → Click 'Add Shortcut' and press your desired key combo"
-echo "   → Recommended: Ctrl+Shift+C"
+echo "  Set up a keyboard shortcut:"
+echo "  → System Settings → Keyboard → Keyboard Shortcuts → Services"
+echo "  → Find 'Citrix Auto-Login' in the General section"
+echo "  → Click 'Add Shortcut' and press your desired key combo"
+echo "  → Recommended: Ctrl+Shift+C"
 echo ""
-echo "3. UPDATE THE SCRIPT with your Citrix login page details:"
-echo "   → Open citrix_autologin.py in a text editor"
-echo "   → Change CITRIX_URL to your actual login URL"
-echo "   → Update the CSS selectors to match your login page"
-echo "   → (See the comments in the script for how to find selectors)"
+echo "To test, run:  python3 -m citrix_autologin"
 echo ""
-echo "4. CLOSE CHROME before first run (Selenium needs exclusive access"
-echo "   to the Chrome profile on the first launch)."
-echo ""
-echo "To test, run:  python3 ${SCRIPT_DIR}/citrix_autologin.py"
+echo "After pressing your shortcut, you'll get macOS notifications:"
+echo "  1. 'Check your phone' — approve the Authenticator push"
+echo "  2. 'All apps launched!' — your Citrix apps are starting"
