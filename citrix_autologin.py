@@ -274,6 +274,61 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
+def cleanup_previous_session():
+    """
+    Cleans up any leftover Chrome/chromedriver processes from a previous run.
+
+    WHY THIS IS NEEDED:
+    The script uses a dedicated Chrome profile folder (~/CitrixAutoLogin/chrome-profile).
+    Chrome locks this folder while it's open — if a previous run of this script is
+    still running (e.g., sitting at the "Press Enter to close" prompt), the profile
+    folder stays locked. A new run can't open Chrome with the same profile and crashes
+    with a "DevToolsActivePort file doesn't exist" error.
+
+    Even after killing the old processes, Chrome can leave behind lock files and
+    crash state that prevent a clean restart. This function handles all of that.
+    """
+    print("Checking for leftover sessions from previous runs...")
+
+    script_profile = os.path.expanduser("~/CitrixAutoLogin/chrome-profile")
+
+    # Step 1: Kill any chromedriver processes from a previous run.
+    # chromedriver is a separate background process that Selenium spawns.
+    # If the previous script didn't exit cleanly, it may still be running.
+    subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True)
+
+    # Step 2: Kill any Chrome windows using our specific profile folder.
+    # We only target Chrome instances using OUR dedicated profile — not any
+    # normal Chrome windows the user might have open.
+    subprocess.run(
+        ["pkill", "-f", f"--user-data-dir={script_profile}"],
+        capture_output=True
+    )
+
+    # Give processes time to fully exit. Chrome can take a couple seconds
+    # to release its file locks after receiving a kill signal.
+    time.sleep(2)
+
+    # Step 3: Remove Chrome's lock files so the profile can be reused.
+    # We do NOT delete the entire profile — keeping it means Chrome
+    # remembers that Citrix Workspace is installed, so the "Welcome"
+    # and "Detect Citrix" splash screens won't appear on every run.
+    #
+    # On macOS, SingletonLock is a symlink, so we need os.path.islink()
+    # to detect it (os.path.exists() follows the symlink and may miss it).
+    lock_files = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
+    for lock_name in lock_files:
+        lock_path = os.path.join(script_profile, lock_name)
+        try:
+            if os.path.islink(lock_path) or os.path.exists(lock_path):
+                os.unlink(lock_path)
+                print(f"  Removed leftover lock file: {lock_name}")
+        except OSError:
+            pass  # Already gone, that's fine
+
+    print("  Ready for new session.")
+
+
 def create_browser():
     """
     Creates a Chrome browser instance controlled by Selenium.
@@ -300,6 +355,26 @@ def create_browser():
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
+    # Prevent the "Chrome didn't shut down correctly — Restore pages?" bubble.
+    chrome_options.add_argument("--hide-crash-restore-bubble")
+
+    # Disable Chrome's "Save password?" popup.
+    # This covers the prompt that appears after login asking to save credentials.
+    chrome_options.add_experimental_option("prefs", {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    })
+
+    # Block the "Open Citrix Workspace Launcher?" dialog.
+    # After login, the Citrix portal tries to launch a custom URL scheme
+    # (receiver://) which triggers a Chrome dialog asking "Open external app?"
+    # Selenium CANNOT click browser-level dialogs — they block everything.
+    # This flag tells Chrome to silently deny all external protocol requests,
+    # preventing the dialog from appearing in the first place.
+    # This is fine because we don't need the native launcher — the script
+    # clicks the app icons directly on the web portal page instead.
+    chrome_options.add_argument("--disable-external-intent-requests")
+
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
@@ -323,94 +398,74 @@ def dismiss_post_login_screens(driver):
     """
     # Each entry is: (description, how to detect it, how to dismiss it)
     # We check by looking for a visible element, then clicking the dismiss button.
-    splash_screens = [
-        {
-            "name": "Welcome to Citrix Workspace app",
-            "detect": (By.XPATH, "//*[contains(@class, '_ctxstxt_WelcomeToReceiver')]"),
-            # The welcome page typically has a "Got it" or similar button.
-            # Common dismiss buttons on this page:
-            "dismiss_options": [
-                (By.CSS_SELECTOR, "#protocolhandler-welcome-installButton"),
-                (By.CSS_SELECTOR, "#protocolhandler-welcome-useFullVersion"),
-                (By.XPATH, "//button[contains(text(), 'Got it')]"),
-                (By.XPATH, "//a[contains(text(), 'Got it')]"),
-                (By.XPATH, "//button[contains(text(), 'Continue')]"),
-                (By.XPATH, "//a[contains(text(), 'Continue')]"),
-                (By.XPATH, "//button[contains(text(), 'OK')]"),
-                (By.XPATH, "//a[contains(text(), 'OK')]"),
-                # Fallback: click anything that looks like a dismiss/action button
-                (By.CSS_SELECTOR, ".welcome-button"),
-                (By.CSS_SELECTOR, ".btn-primary"),
-            ],
-        },
-        {
-            "name": "Detect Citrix Workspace / Receiver",
-            "detect": (By.CSS_SELECTOR, "#protocolhandler-detect-page"),
-            "dismiss_options": [
-                # "Already installed" or "Use web browser" skips the detection
-                (By.CSS_SELECTOR, "#protocolhandler-detect-alreadyInstalled"),
-                (By.XPATH, "//a[contains(text(), 'Already installed')]"),
-                (By.XPATH, "//a[contains(text(), 'Use web browser')]"),
-                (By.XPATH, "//a[contains(text(), 'Use light version')]"),
-            ],
-        },
-        {
-            "name": "Citrix Workspace not detected",
-            "detect": (By.CSS_SELECTOR, "#protocolhandler-notDetected-page"),
-            "dismiss_options": [
-                (By.CSS_SELECTOR, "#protocolhandler-notDetected-useFullVersion"),
-                (By.XPATH, "//a[contains(text(), 'Already installed')]"),
-                (By.XPATH, "//a[contains(text(), 'Use web browser')]"),
-                (By.XPATH, "//a[contains(text(), 'Use light version')]"),
-            ],
-        },
-        {
-            "name": "Cookie / privacy consent banner",
-            "detect": (By.XPATH, "//*[contains(@class, 'cookie') or contains(@class, 'consent')]"),
-            "dismiss_options": [
-                (By.XPATH, "//button[contains(text(), 'Accept')]"),
-                (By.XPATH, "//a[contains(text(), 'Accept')]"),
-                (By.XPATH, "//button[contains(text(), 'OK')]"),
-                (By.XPATH, "//button[contains(text(), 'Got it')]"),
-            ],
-        },
-    ]
+    # Instead of trying to detect and click through each individual splash
+    # screen (Welcome → Detect → Not Detected), we take a simpler approach:
+    #
+    # Look for "Already installed" — this link appears on every version of
+    # the Citrix detection/welcome flow and skips straight to the app portal.
+    # We also look for "Detect again" since that appears alongside it.
+    #
+    # We loop because:
+    #   - The first screen (Welcome) may not have "Already installed" yet —
+    #     we click "Detect Citrix Workspace app" to advance to the next screen
+    #   - The second screen (Detecting...) shows "Already installed" after
+    #     a brief detection attempt
+    #   - There may be additional screens after that
 
-    # Run through up to 3 passes — dismissing one screen can reveal another
-    for pass_num in range(3):
-        found_any = False
+    for attempt in range(5):
+        time.sleep(3)  # Let the page settle between attempts
 
-        for screen in splash_screens:
+        # Priority 1: Click "Already installed" if it's visible.
+        # This is the fastest way past ALL detection screens.
+        try:
+            already_installed = driver.find_element(
+                By.XPATH, "//*[contains(text(), 'Already installed')]"
+            )
+            if already_installed.is_displayed():
+                print("  Found 'Already installed' — clicking to skip detection...")
+                driver.execute_script("arguments[0].click();", already_installed)
+                time.sleep(3)
+                continue  # Check if there's another screen after this
+        except Exception:
+            pass
+
+        # Priority 2: Click "Detect Citrix Workspace app" button.
+        # This is the big teal button on the Welcome screen. Clicking it
+        # advances to the detection screen, which then shows "Already installed".
+        #
+        # We use //* instead of //button because Citrix renders this as
+        # different element types depending on the version (<span>, <div>,
+        # <a>, or <button>). We also use JavaScript click because Selenium's
+        # normal .click() can fail if another element is overlapping it.
+        try:
+            detect_btn = driver.find_element(
+                By.XPATH, "//*[contains(text(), 'Detect Citrix Workspace')]"
+            )
+            if detect_btn.is_displayed():
+                print("  Found 'Detect Citrix Workspace app' — clicking to advance...")
+                driver.execute_script("arguments[0].click();", detect_btn)
+                time.sleep(5)
+                continue
+        except Exception:
+            pass
+
+        # Priority 3: Click "Use light version" or "Use web browser" links.
+        # Some Citrix deployments offer these as alternatives.
+        for link_text in ["Use light version", "Use web browser"]:
             try:
-                detect_method, detect_selector = screen["detect"]
-                element = driver.find_element(detect_method, detect_selector)
-
-                if element.is_displayed():
-                    print(f"  Found: '{screen['name']}' — looking for dismiss button...")
-                    found_any = True
-
-                    # Try each dismiss option until one works
-                    dismissed = False
-                    for btn_method, btn_selector in screen["dismiss_options"]:
-                        try:
-                            btn = driver.find_element(btn_method, btn_selector)
-                            if btn.is_displayed():
-                                print(f"  Clicking dismiss button...")
-                                btn.click()
-                                time.sleep(2)
-                                dismissed = True
-                                break
-                        except Exception:
-                            continue
-
-                    if not dismissed:
-                        print(f"  WARNING: Found '{screen['name']}' but couldn't find a dismiss button.")
-                        print(f"  You may need to dismiss it manually.")
+                link = driver.find_element(
+                    By.XPATH, f"//*[contains(text(), '{link_text}')]"
+                )
+                if link.is_displayed():
+                    print(f"  Found '{link_text}' — clicking...")
+                    driver.execute_script("arguments[0].click();", link)
+                    time.sleep(3)
+                    break
             except Exception:
-                continue  # Screen not present, move on
-
-        if not found_any:
-            break  # No more splash screens, we're done
+                continue
+        else:
+            # No splash screen elements found — we're through!
+            break
 
     print("  Post-login screens handled.")
 
@@ -542,6 +597,12 @@ def login_to_citrix():
     5. Wait for you to approve on your phone
     6. Launch your configured Citrix apps from the portal
     """
+    # --- Clean up any previous session ---
+    # This ensures the Chrome profile lock is released before we try to launch
+    # a new browser window, so the script works even if you run it again without
+    # closing the previous Terminal window or Chrome window.
+    cleanup_previous_session()
+
     # --- Get credentials ---
     print("Reading credentials from Keychain...")
     username, password = get_credentials_from_keychain()
@@ -638,12 +699,15 @@ def login_to_citrix():
         print("Login may not have completed. The browser is still open —")
         print("you can finish logging in manually if needed.")
 
-    # Keep the script alive so Chrome doesn't close immediately.
-    # When Selenium's Python process exits, it can close the browser.
-    # This input() call keeps the process running until you press Enter.
-    print("\nBrowser will stay open. Your Citrix apps should be starting up.")
-    input("Press Enter to close the browser (or Ctrl+C to keep it open)...")
+    # Clean up: close the Selenium-controlled Chrome window and chromedriver.
+    # This is safe because the Citrix apps run independently — they launch
+    # via the Citrix Workspace client on your Mac, not inside this Chrome window.
+    # Closing Chrome here also releases the profile lock cleanly, so the
+    # script can run again without issues.
+    print("\nClosing the login browser window...")
+    print("(Your Citrix apps will continue running — they don't need this window.)")
     driver.quit()
+    print("\nDone! You can close this Terminal window.")
 
 
 # ---------------------------------------------------------------------------
