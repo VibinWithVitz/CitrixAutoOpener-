@@ -176,6 +176,35 @@ polling checks repeatedly: "Has the page changed yet? No? Check again in
 """
 
 
+def is_on_portal(driver):
+    """
+    Checks if the browser has reached the Citrix app portal (post-login).
+
+    Returns True if the current page looks like the portal rather than
+    a login/auth page. We check both the URL and page content.
+    """
+    current_url = driver.current_url.lower()
+    login_indicators = ["login", "logon", "auth", "oauth", "signin", "mfa", "verify"]
+    still_on_login = any(indicator in current_url for indicator in login_indicators)
+
+    if still_on_login:
+        # Even if URL looks like login, check if portal elements are present.
+        # Some Citrix deployments keep a similar URL but change the page content.
+        try:
+            driver.find_element(By.CSS_SELECTOR, "#allAppsFilterBtn")
+            return True
+        except Exception:
+            pass
+        try:
+            driver.find_element(By.XPATH, "//img[contains(@class,'storeapp-icon')]")
+            return True
+        except Exception:
+            pass
+        return False
+
+    return True  # URL doesn't look like login page — we're through
+
+
 def wait_for_push_approval(driver, timeout=PUSH_APPROVAL_TIMEOUT):
     """
     Waits for the user to approve the Microsoft Authenticator push notification.
@@ -201,41 +230,53 @@ def wait_for_push_approval(driver, timeout=PUSH_APPROVAL_TIMEOUT):
 
     start_time = time.time()
     poll_interval = 2  # Check every 2 seconds
+    mfa_in_progress = False
 
     while time.time() - start_time < timeout:
         elapsed = int(time.time() - start_time)
 
-        # Check if the URL has changed (indicating successful login)
+        # Check if MFA/processing is actively in progress.
+        # The Citrix page shows "Your request is being processed" or
+        # "Firstfactor" while waiting for MFA approval. If we see these,
+        # we know auth is progressing (not stuck), so we stay patient.
+        if not mfa_in_progress:
+            try:
+                page_text = driver.find_element(By.TAG_NAME, "body").text
+                if any(phrase in page_text for phrase in [
+                    "request is being processed",
+                    "Firstfactor",
+                    "Approve sign-in request",
+                    "approve the notification",
+                ]):
+                    mfa_in_progress = True
+                    print("  MFA in progress — waiting for your approval...")
+            except Exception:
+                pass
+
+        # Check if we've reached the portal
         current_url = driver.current_url
-
-        # --- Option A: Detect by URL change ---
-        # If the URL no longer contains common login/auth path segments,
-        # it probably means we've been redirected to the portal.
-        login_indicators = ["login", "logon", "auth", "oauth", "signin", "mfa", "verify"]
-        still_on_login = any(indicator in current_url.lower() for indicator in login_indicators)
-
-        if current_url != login_url and not still_on_login:
+        if current_url != login_url and is_on_portal(driver):
             print(f"\nLogin detected! Redirected to: {current_url}")
             return True
 
-        # --- Option B: Detect by post-login element ---
-        # Uncomment this block if URL detection isn't reliable for your setup.
-        # if 'POST_LOGIN_SELECTOR' in globals():
-        #     try:
-        #         from selenium.webdriver.common.by import By
-        #         driver.find_element(By.CSS_SELECTOR, POST_LOGIN_SELECTOR)
-        #         print(f"\nLogin detected! Found portal element.")
-        #         return True
-        #     except Exception:
-        #         pass  # Element not found yet, keep waiting
+        # Also check portal elements even if URL hasn't changed much
+        if is_on_portal(driver):
+            print(f"\nLogin detected! Portal elements found on: {current_url}")
+            return True
 
         # Print a status dot every 10 seconds so you know it's still running
         if elapsed % 10 == 0 and elapsed > 0:
-            print(f"  Still waiting... ({elapsed}s elapsed)")
+            status = " (MFA in progress)" if mfa_in_progress else ""
+            print(f"  Still waiting... ({elapsed}s elapsed){status}")
 
         time.sleep(poll_interval)
 
-    # If we get here, we timed out
+    # If we get here, we timed out — but do a final check.
+    # The page may have loaded right at the timeout boundary.
+    if is_on_portal(driver):
+        print(f"\nLogin detected at timeout! Portal loaded on: {driver.current_url}")
+        return True
+
     print(f"\nTimed out after {timeout} seconds waiting for push approval.")
     return False
 
@@ -688,7 +729,19 @@ def login_to_citrix():
     if success:
         print("")
         print("Login complete!")
+    else:
+        print("")
+        print("Push approval timed out, but checking if the page loaded anyway...")
+        # Give it a few more seconds — the redirect may be in progress
+        time.sleep(5)
+        if is_on_portal(driver):
+            print("Portal loaded! Continuing with app launches.")
+            success = True
+        else:
+            print("Login may not have completed. The browser is still open —")
+            print("you can finish logging in manually if needed.")
 
+    if success:
         # --- Dismiss any post-login splash screens ---
         # Citrix often shows "Welcome to Workspace", "Detect Receiver",
         # or similar screens before letting you see your apps. This
@@ -699,10 +752,6 @@ def login_to_citrix():
         # --- Launch Citrix apps ---
         # Now that we're past all splash screens, find and click on each app.
         launch_citrix_apps(driver, CITRIX_APPS_TO_LAUNCH)
-    else:
-        print("")
-        print("Login may not have completed. The browser is still open —")
-        print("you can finish logging in manually if needed.")
 
     # Leave Chrome open so the user can go back and launch more apps manually.
     # The cleanup_previous_session() function at the start of the next run
