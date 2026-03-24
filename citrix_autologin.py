@@ -211,7 +211,7 @@ def wait_for_push_approval(driver, timeout=PUSH_APPROVAL_TIMEOUT):
         # --- Option A: Detect by URL change ---
         # If the URL no longer contains common login/auth path segments,
         # it probably means we've been redirected to the portal.
-        login_indicators = ["login", "auth", "oauth", "signin", "mfa", "verify"]
+        login_indicators = ["login", "logon", "auth", "oauth", "signin", "mfa", "verify"]
         still_on_login = any(indicator in current_url.lower() for indicator in login_indicators)
 
         if current_url != login_url and not still_on_login:
@@ -354,6 +354,11 @@ def create_browser():
     # Quality-of-life options
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+    # Keep Chrome open after the script exits.
+    # By default, when the Python process ends, chromedriver shuts down and
+    # takes Chrome with it. "detach" tells chromedriver to leave Chrome running.
+    chrome_options.add_experimental_option("detach", True)
 
     # Prevent the "Chrome didn't shut down correctly — Restore pages?" bubble.
     chrome_options.add_argument("--hide-crash-restore-bubble")
@@ -699,15 +704,11 @@ def login_to_citrix():
         print("Login may not have completed. The browser is still open —")
         print("you can finish logging in manually if needed.")
 
-    # Clean up: close the Selenium-controlled Chrome window and chromedriver.
-    # This is safe because the Citrix apps run independently — they launch
-    # via the Citrix Workspace client on your Mac, not inside this Chrome window.
-    # Closing Chrome here also releases the profile lock cleanly, so the
-    # script can run again without issues.
-    print("\nClosing the login browser window...")
-    print("(Your Citrix apps will continue running — they don't need this window.)")
-    driver.quit()
-    print("\nDone! You can close this Terminal window.")
+    # Leave Chrome open so the user can go back and launch more apps manually.
+    # The cleanup_previous_session() function at the start of the next run
+    # will handle any leftover Chrome/chromedriver processes if needed.
+    print("\nDone! Chrome will stay open so you can launch more apps if needed.")
+    print("Thank you for using the Citrix Auto Opener!")
 
 
 # ---------------------------------------------------------------------------

@@ -94,6 +94,21 @@ echo "Step 6: Creating keyboard shortcut..."
 # Get the directory where this setup script lives
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Create a .command launcher file. When macOS opens a .command file, it
+# automatically opens a new Terminal window and runs it — no AppleScript
+# needed. This avoids the "Spotify wants access to control Terminal" dialog
+# that happens when AppleScript's "tell application Terminal" is used,
+# because macOS blames whatever app is in the foreground for the request.
+LAUNCHER="$SCRIPT_DIR/run_citrix.command"
+cat > "$LAUNCHER" << LAUNCHER_SCRIPT
+#!/bin/bash
+# Launcher for Citrix Auto-Login
+# This file is opened by macOS, which runs it in a new Terminal window.
+python3 "$SCRIPT_DIR/citrix_autologin.py"
+LAUNCHER_SCRIPT
+chmod +x "$LAUNCHER"
+echo "  Launcher script created: run_citrix.command ✓"
+
 # Create an Automator Quick Action (workflow) that runs our Python script.
 # Quick Actions can be assigned keyboard shortcuts in System Settings.
 WORKFLOW_DIR="$HOME/Library/Services/Citrix Auto-Login.workflow"
@@ -175,10 +190,7 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW
                 <key>ActionParameters</key>
                 <dict>
                     <key>COMMAND_STRING</key>
-                    <string>osascript -e 'tell application "Terminal"
-    activate
-    do script "python3 ${SCRIPT_DIR}/citrix_autologin.py"
-end tell'</string>
+                    <string>open "${SCRIPT_DIR}/run_citrix.command"</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
                     <key>inputMethod</key>
