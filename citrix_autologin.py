@@ -71,7 +71,7 @@ CITRIX_APPS_TO_LAUNCH = [
 
 # Seconds to wait between launching each app.
 # Citrix can be slow — give it time to process each launch before the next.
-APP_LAUNCH_DELAY = 3
+APP_LAUNCH_DELAY = 2
 
 # Seconds to wait for the portal page to fully load before looking for apps.
 PORTAL_LOAD_WAIT = 3
@@ -341,14 +341,28 @@ def cleanup_previous_session():
     # Step 2: Kill any Chrome windows using our specific profile folder.
     # We only target Chrome instances using OUR dedicated profile — not any
     # normal Chrome windows the user might have open.
+    #
+    # First try SIGTERM (graceful), then escalate to SIGKILL if Chrome
+    # is still hanging on to the profile. On macOS, Chrome can ignore
+    # SIGTERM if it's showing a dialog or waiting on a renderer process.
     subprocess.run(
         ["pkill", "-f", f"--user-data-dir={script_profile}"],
         capture_output=True
     )
-
-    # Give processes time to fully exit. Chrome can take a couple seconds
-    # to release its file locks after receiving a kill signal.
     time.sleep(2)
+
+    # Check if any processes are still holding the profile and force-kill them
+    result = subprocess.run(
+        ["pgrep", "-f", f"--user-data-dir={script_profile}"],
+        capture_output=True, text=True
+    )
+    if result.stdout.strip():
+        print("  Chrome didn't exit gracefully — force-killing...")
+        subprocess.run(
+            ["pkill", "-9", "-f", f"--user-data-dir={script_profile}"],
+            capture_output=True
+        )
+        time.sleep(2)
 
     # Step 3: Remove Chrome's lock files so the profile can be reused.
     # We do NOT delete the entire profile — keeping it means Chrome
@@ -657,6 +671,21 @@ def login_to_citrix():
     # --- Launch browser ---
     print(f"Opening Chrome to {CITRIX_URL}...")
     driver = create_browser()
+
+    # Clear ALL cookies so the login flow starts completely fresh.
+    #
+    # Previously we tried to preserve Microsoft's "remember this device"
+    # cookies to skip a second MFA push, but stale or partially-expired
+    # Microsoft cookies actually cause DOUBLE MFA pushes — the auth flow
+    # tries the cached session (push #1), it fails, then falls back to
+    # fresh auth (push #2). Clearing everything ensures exactly one push.
+    #
+    # We load a non-existent path on the Citrix domain first — this gives
+    # us access to the domain's cookies without triggering the actual login
+    # flow. After clearing, we navigate to the real URL with a clean slate.
+    citrix_domain = CITRIX_URL.split("//")[1].split("/")[0]  # e.g. "gateway.scmc.org"
+    driver.get(f"https://{citrix_domain}/favicon.ico")
+    driver.delete_all_cookies()
     driver.get(CITRIX_URL)
 
     # --- Wait for the page to load ---
