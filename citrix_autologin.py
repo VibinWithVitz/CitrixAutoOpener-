@@ -342,27 +342,43 @@ def cleanup_previous_session():
     # We only target Chrome instances using OUR dedicated profile — not any
     # normal Chrome windows the user might have open.
     #
-    # First try SIGTERM (graceful), then escalate to SIGKILL if Chrome
-    # is still hanging on to the profile. On macOS, Chrome can ignore
-    # SIGTERM if it's showing a dialog or waiting on a renderer process.
+    # Chrome spawns many child processes (renderers, GPU, utility) that all
+    # hold locks on the profile directory. We must wait for ALL of them to
+    # exit before launching a new Chrome — otherwise the new instance sees
+    # a locked profile and shows "Something went wrong" dialogs.
+    #
+    # Strategy: SIGTERM first, then poll until all processes are gone.
+    # If any linger after 5 seconds, escalate to SIGKILL and poll again.
     subprocess.run(
         ["pkill", "-f", f"--user-data-dir={script_profile}"],
         capture_output=True
     )
-    time.sleep(2)
 
-    # Check if any processes are still holding the profile and force-kill them
-    result = subprocess.run(
-        ["pgrep", "-f", f"--user-data-dir={script_profile}"],
-        capture_output=True, text=True
-    )
-    if result.stdout.strip():
+    # Poll until all Chrome processes using our profile have exited
+    def _profile_processes_alive():
+        result = subprocess.run(
+            ["pgrep", "-f", f"--user-data-dir={script_profile}"],
+            capture_output=True, text=True
+        )
+        return bool(result.stdout.strip())
+
+    # Wait up to 5 seconds for graceful exit
+    for _ in range(10):
+        if not _profile_processes_alive():
+            break
+        time.sleep(0.5)
+
+    # If processes are still alive, force-kill and wait again
+    if _profile_processes_alive():
         print("  Chrome didn't exit gracefully — force-killing...")
         subprocess.run(
             ["pkill", "-9", "-f", f"--user-data-dir={script_profile}"],
             capture_output=True
         )
-        time.sleep(2)
+        for _ in range(10):
+            if not _profile_processes_alive():
+                break
+            time.sleep(0.5)
 
     # Step 3: Remove Chrome's lock files so the profile can be reused.
     # We do NOT delete the entire profile — keeping it means Chrome
