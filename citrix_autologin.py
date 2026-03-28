@@ -311,8 +311,10 @@ To find the right selectors for YOUR Citrix page:
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 def cleanup_previous_session():
@@ -451,7 +453,12 @@ def create_browser():
     # clicks the app icons directly on the web portal page instead.
     chrome_options.add_argument("--disable-external-intent-requests")
 
-    driver = webdriver.Chrome(options=chrome_options)
+    # Use webdriver-manager to automatically download the correct ChromeDriver
+    # version that matches the installed Chrome browser. This avoids the
+    # "This version of ChromeDriver only supports Chrome version X" error
+    # that happens when Chrome auto-updates but chromedriver doesn't.
+    service = ChromeService(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
 
