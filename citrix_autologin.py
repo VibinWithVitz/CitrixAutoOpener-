@@ -29,6 +29,8 @@ import subprocess
 import re
 import time
 import os
+import sys
+import signal
 
 # ---------------------------------------------------------------------------
 # STEP 1: CONFIGURATION
@@ -317,89 +319,164 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 
-def cleanup_previous_session():
+# ---------------------------------------------------------------------------
+# PID FILE MANAGEMENT
+# ---------------------------------------------------------------------------
+# Instead of trying to hunt down and kill orphan Chrome processes by name,
+# we take a simpler approach: the script manages its OWN lifecycle.
+#
+# - On startup, check if a previous instance is still running (via PID file)
+# - If so, send it SIGTERM → its signal handler calls driver.quit() → Chrome
+#   shuts down cleanly → no orphan processes, no stale lock files
+# - The new instance then starts fresh with a clean profile
+#
+# This means pressing the hotkey (Ctrl+Shift+C) again will:
+#   1. Kill the previous script + its Chrome cleanly
+#   2. Start a brand new login session
+
+PID_FILE = os.path.expanduser("~/CitrixAutoLogin/.pid")
+
+
+def kill_previous_instance():
     """
-    Cleans up any leftover Chrome/chromedriver processes from a previous run.
+    If a previous instance of this script is still running, send it SIGTERM
+    so it can shut down Chrome cleanly via its signal handler.
 
-    WHY THIS IS NEEDED:
-    The script uses a dedicated Chrome profile folder (~/CitrixAutoLogin/chrome-profile).
-    Chrome locks this folder while it's open — if a previous run of this script is
-    still running (e.g., sitting at the "Press Enter to close" prompt), the profile
-    folder stays locked. A new run can't open Chrome with the same profile and crashes
-    with a "DevToolsActivePort file doesn't exist" error.
-
-    Even after killing the old processes, Chrome can leave behind lock files and
-    crash state that prevent a clean restart. This function handles all of that.
+    Returns True if a previous instance was found and killed.
     """
-    print("Checking for leftover sessions from previous runs...")
+    if not os.path.exists(PID_FILE):
+        return False
 
+    try:
+        with open(PID_FILE, "r") as f:
+            old_pid = int(f.read().strip())
+    except (ValueError, OSError):
+        # Corrupt or unreadable PID file — remove it and move on
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
+        return False
+
+    # Check if the process is actually still running
+    try:
+        os.kill(old_pid, 0)  # Signal 0 = just check if process exists
+    except ProcessLookupError:
+        # Process is already gone — clean up stale PID file
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
+        return False
+    except PermissionError:
+        # Process exists but we can't signal it — shouldn't happen for our own process
+        return False
+
+    # Process is alive — send SIGTERM so it shuts down Chrome cleanly
+    print(f"Found previous instance (PID {old_pid}) — sending shutdown signal...")
+    try:
+        os.kill(old_pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+    # Wait for it to exit (up to 10 seconds)
+    for _ in range(20):
+        try:
+            os.kill(old_pid, 0)
+            time.sleep(0.5)
+        except ProcessLookupError:
+            print("  Previous instance shut down cleanly.")
+            break
+    else:
+        # Still alive after 10 seconds — force kill
+        print("  Previous instance didn't exit — force killing...")
+        try:
+            os.kill(old_pid, signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(1)
+
+    # Clean up the old PID file
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+    return True
+
+
+def write_pid_file():
+    """Write our PID to the PID file so future runs can find and stop us."""
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def remove_pid_file():
+    """Remove the PID file on exit."""
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+def cleanup_orphan_chrome():
+    """
+    Safety net: kill any Chrome processes using our profile that outlived
+    the previous script.
+
+    This handles the case where the script crashed, was force-killed, or
+    was running the old version with detach=True — leaving Chrome alive
+    with no script to manage it. Without this, the profile stays locked
+    and the new Chrome can't start.
+
+    This only targets Chrome instances using OUR dedicated profile folder,
+    never the user's normal Chrome windows.
+    """
     script_profile = os.path.expanduser("~/CitrixAutoLogin/chrome-profile")
 
-    # Step 1: Kill any chromedriver processes from a previous run.
-    # chromedriver is a separate background process that Selenium spawns.
-    # If the previous script didn't exit cleanly, it may still be running.
-    subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True)
+    result = subprocess.run(
+        ["pgrep", "-f", f"--user-data-dir={script_profile}"],
+        capture_output=True, text=True
+    )
+    if not result.stdout.strip():
+        return  # No orphan Chrome processes — nothing to do
 
-    # Step 2: Kill any Chrome windows using our specific profile folder.
-    # We only target Chrome instances using OUR dedicated profile — not any
-    # normal Chrome windows the user might have open.
-    #
-    # Chrome spawns many child processes (renderers, GPU, utility) that all
-    # hold locks on the profile directory. We must wait for ALL of them to
-    # exit before launching a new Chrome — otherwise the new instance sees
-    # a locked profile and shows "Something went wrong" dialogs.
-    #
-    # Strategy: SIGTERM first, then poll until all processes are gone.
-    # If any linger after 5 seconds, escalate to SIGKILL and poll again.
+    print("Found orphan Chrome processes from a previous run — cleaning up...")
+
+    # SIGTERM first (graceful)
     subprocess.run(
         ["pkill", "-f", f"--user-data-dir={script_profile}"],
         capture_output=True
     )
 
-    # Poll until all Chrome processes using our profile have exited
-    def _profile_processes_alive():
-        result = subprocess.run(
+    # Wait up to 5 seconds for them to exit
+    for _ in range(10):
+        check = subprocess.run(
             ["pgrep", "-f", f"--user-data-dir={script_profile}"],
             capture_output=True, text=True
         )
-        return bool(result.stdout.strip())
-
-    # Wait up to 5 seconds for graceful exit
-    for _ in range(10):
-        if not _profile_processes_alive():
+        if not check.stdout.strip():
             break
         time.sleep(0.5)
-
-    # If processes are still alive, force-kill and wait again
-    if _profile_processes_alive():
-        print("  Chrome didn't exit gracefully — force-killing...")
+    else:
+        # Still alive — force kill
         subprocess.run(
             ["pkill", "-9", "-f", f"--user-data-dir={script_profile}"],
             capture_output=True
         )
-        for _ in range(10):
-            if not _profile_processes_alive():
-                break
-            time.sleep(0.5)
+        time.sleep(1)
 
-    # Step 3: Remove Chrome's lock files so the profile can be reused.
-    # We do NOT delete the entire profile — keeping it means Chrome
-    # remembers that Citrix Workspace is installed, so the "Welcome"
-    # and "Detect Citrix" splash screens won't appear on every run.
-    #
-    # On macOS, SingletonLock is a symlink, so we need os.path.islink()
-    # to detect it (os.path.exists() follows the symlink and may miss it).
-    lock_files = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
-    for lock_name in lock_files:
+    # Clean up lock files so the profile can be reused
+    for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
         lock_path = os.path.join(script_profile, lock_name)
         try:
             if os.path.islink(lock_path) or os.path.exists(lock_path):
                 os.unlink(lock_path)
-                print(f"  Removed leftover lock file: {lock_name}")
         except OSError:
-            pass  # Already gone, that's fine
+            pass
 
-    print("  Ready for new session.")
+    print("  Orphan processes cleaned up.")
 
 
 def create_browser():
@@ -428,10 +505,10 @@ def create_browser():
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
-    # Keep Chrome open after the script exits.
-    # By default, when the Python process ends, chromedriver shuts down and
-    # takes Chrome with it. "detach" tells chromedriver to leave Chrome running.
-    chrome_options.add_experimental_option("detach", True)
+    # NOTE: We intentionally do NOT use detach=True here. The script keeps
+    # running and owns Chrome's lifecycle. When the script exits (via hotkey,
+    # Ctrl+C, or closing Terminal), it calls driver.quit() for a clean shutdown.
+    # This eliminates orphan Chrome processes and stale profile lock files.
 
     # Prevent the "Chrome didn't shut down correctly — Restore pages?" bubble.
     chrome_options.add_argument("--hide-crash-restore-bubble")
@@ -673,18 +750,27 @@ def login_to_citrix():
     Main function that orchestrates the entire login flow.
 
     The flow is:
-    1. Read credentials from Keychain
-    2. Open Chrome and navigate to the login page
-    3. Fill in username and password
-    4. Submit the form (triggers Authenticator push)
-    5. Wait for you to approve on your phone
-    6. Launch your configured Citrix apps from the portal
+    1. Kill any previous instance of this script (and its Chrome) cleanly
+    2. Read credentials from Keychain
+    3. Open Chrome and navigate to the login page
+    4. Fill in username and password
+    5. Submit the form (triggers Authenticator push)
+    6. Wait for you to approve on your phone
+    7. Launch your configured Citrix apps from the portal
+    8. Stay alive until the user presses the hotkey again (or Ctrl+C)
     """
-    # --- Clean up any previous session ---
-    # This ensures the Chrome profile lock is released before we try to launch
-    # a new browser window, so the script works even if you run it again without
-    # closing the previous Terminal window or Chrome window.
-    cleanup_previous_session()
+    # --- Kill any previous instance ---
+    # If the user pressed the hotkey while a previous run is still going,
+    # send it SIGTERM so it shuts down Chrome cleanly, then proceed.
+    kill_previous_instance()
+
+    # --- Safety net: clean up orphan Chrome processes ---
+    # If the previous script crashed or was the old version with detach=True,
+    # Chrome may still be alive with no script managing it. Kill those too.
+    cleanup_orphan_chrome()
+
+    # --- Write our PID so future runs can find and stop us ---
+    write_pid_file()
 
     # --- Get credentials ---
     print("Reading credentials from Keychain...")
@@ -694,6 +780,24 @@ def login_to_citrix():
     # --- Launch browser ---
     print(f"Opening Chrome to {CITRIX_URL}...")
     driver = create_browser()
+
+    # --- Register signal handlers for clean shutdown ---
+    # When the user presses the hotkey again (or Ctrl+C, or closes Terminal),
+    # these handlers ensure driver.quit() is called so Chrome shuts down
+    # properly — no orphan processes, no stale lock files.
+    def handle_shutdown(signum, frame):
+        sig_name = signal.Signals(signum).name
+        print(f"\n{sig_name} received — shutting down Chrome cleanly...")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        remove_pid_file()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGHUP, handle_shutdown)  # Terminal window closed
 
     # Clear ALL cookies so the login flow starts completely fresh.
     #
@@ -805,11 +909,33 @@ def login_to_citrix():
         # Now that we're past all splash screens, find and click on each app.
         launch_citrix_apps(driver, CITRIX_APPS_TO_LAUNCH)
 
-    # Leave Chrome open so the user can go back and launch more apps manually.
-    # The cleanup_previous_session() function at the start of the next run
-    # will handle any leftover Chrome/chromedriver processes if needed.
-    print("\nDone! Chrome will stay open so you can launch more apps if needed.")
+    # --- Stay alive so Chrome stays open ---
+    # The script keeps running in the background. Chrome stays open for the
+    # user to work with their Citrix apps. The script will exit cleanly when:
+    #   - The user presses the hotkey again (Ctrl+Shift+C) → new instance
+    #     sends SIGTERM → signal handler calls driver.quit()
+    #   - The user presses Ctrl+C in Terminal → SIGINT → same clean shutdown
+    #   - The user closes the Terminal window → SIGHUP → same clean shutdown
+    print("\nDone! Chrome will stay open so you can use your Citrix apps.")
+    print("Press Ctrl+Shift+C again (or Ctrl+C) to close Chrome and exit.")
     print("Thank you for using the Citrix Auto Opener!")
+
+    try:
+        # Sleep in a loop — the signal handlers will interrupt this when
+        # it's time to shut down. We use short sleeps so the process
+        # remains responsive to signals.
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        # Belt-and-suspenders: if we somehow get here without the signal
+        # handler running, still clean up.
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        remove_pid_file()
 
 
 # ---------------------------------------------------------------------------
