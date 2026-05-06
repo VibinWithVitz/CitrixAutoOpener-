@@ -716,6 +716,11 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
 
             # Strategy 5: Data attribute match
             (By.CSS_SELECTOR, f"[data-name='{app_name}']"),
+
+            # Strategy 6: Find by storeapp-name paragraph text → click ancestor <a>
+            # Matches portal structure: <p class="storeapp-name">App Name</p>
+            # Used as last resort since the <a> ancestor may not be the launch trigger.
+            (By.XPATH, f"//p[contains(@class,'storeapp-name') and contains(text(),'{app_name}')]/ancestor::a[1]"),
         ]
 
         for method, selector in strategies:
@@ -799,20 +804,27 @@ def login_to_citrix():
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGHUP, handle_shutdown)  # Terminal window closed
 
-    # Clear ALL cookies so the login flow starts completely fresh.
+    # Clear ALL browser data so the login flow starts completely fresh.
     #
-    # Previously we tried to preserve Microsoft's "remember this device"
-    # cookies to skip a second MFA push, but stale or partially-expired
-    # Microsoft cookies actually cause DOUBLE MFA pushes — the auth flow
-    # tries the cached session (push #1), it fails, then falls back to
-    # fresh auth (push #2). Clearing everything ensures exactly one push.
+    # Cookies alone aren't enough — Microsoft's auth also stores session
+    # state in localStorage, sessionStorage, IndexedDB, and cache. If any
+    # of that survives, the auth flow detects a "remembered" session and
+    # sends an automatic MFA push before we even submit credentials,
+    # causing DOUBLE MFA pushes.
     #
-    # We load a non-existent path on the Citrix domain first — this gives
-    # us access to the domain's cookies without triggering the actual login
-    # flow. After clearing, we navigate to the real URL with a clean slate.
-    citrix_domain = CITRIX_URL.split("//")[1].split("/")[0]  # e.g. "gateway.scmc.org"
-    driver.get(f"https://{citrix_domain}/favicon.ico")
-    driver.delete_all_cookies()
+    # Using Chrome DevTools Protocol (CDP) to wipe everything ensures
+    # a truly clean slate — exactly one push notification per login.
+    driver.execute_cdp_cmd("Storage.clearDataForOrigin", {
+        "origin": CITRIX_URL.rstrip("/"),
+        "storageTypes": "all",
+    })
+    # Also clear Microsoft's auth domain — this is where SSO session
+    # state lives that can trigger an automatic push.
+    driver.execute_cdp_cmd("Storage.clearDataForOrigin", {
+        "origin": "https://login.microsoftonline.com",
+        "storageTypes": "all",
+    })
+    driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
     driver.get(CITRIX_URL)
 
     # --- Wait for the page to load ---
