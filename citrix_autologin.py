@@ -316,6 +316,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -518,6 +519,12 @@ def create_browser():
     chrome_options.add_experimental_option("prefs", {
         "credentials_enable_service": False,
         "profile.password_manager_enabled": False,
+        # Allow the Citrix portal to download multiple .ica files without
+        # Chrome showing "This site wants to download multiple files. Allow?"
+        # Each app launch triggers an .ica file download. Without this,
+        # Chrome blocks every download after the first one — which is why
+        # only Epic was opening. Value 1 = allow automatic downloads.
+        "profile.default_content_setting_values.automatic_downloads": 1,
     })
 
     # Block the "Open Citrix Workspace Launcher?" dialog.
@@ -674,6 +681,25 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
     except Exception:
         print("  (No 'All Apps' filter found — portal may already show all apps)")
 
+    # Dump all visible app names so we can diagnose name mismatches
+    print("\n--- Apps visible on portal ---")
+    for source, method, selector in [
+        ("img alt",   By.XPATH,        "//img[contains(@class,'storeapp-icon')]"),
+        ("storeapp-name", By.XPATH,    "//p[contains(@class,'storeapp-name')]"),
+        ("a[title]",  By.CSS_SELECTOR, "a[title]"),
+    ]:
+        try:
+            els = driver.find_elements(method, selector)
+            visible = [el for el in els if el.is_displayed()]
+            if visible:
+                for el in visible:
+                    name = el.get_attribute("alt") or el.get_attribute("title") or el.text
+                    if name and name.strip():
+                        print(f"  [{source}] {name.strip()!r}")
+        except Exception:
+            pass
+    print("--- End of app list ---\n")
+
     for app_name in app_names:
         print(f"\nLooking for app: '{app_name}'...")
         launched = False
@@ -730,8 +756,20 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
                 clickable = [el for el in elements if el.is_displayed()]
 
                 if clickable:
+                    el = clickable[0]
                     print(f"  Found '{app_name}' — clicking to launch...")
-                    clickable[0].click()
+                    # Use ActionChains for a realistic mouse interaction.
+                    # Citrix's JS listens for the full mousedown → mouseup →
+                    # click event sequence. A synthetic JS click() only fires
+                    # the click event, which is why only the first app was
+                    # launching — subsequent clicks were "heard" by the DOM
+                    # but ignored by Citrix's event handlers.
+                    #
+                    # ActionChains moves the mouse to the element center and
+                    # performs a real click, producing the full event chain.
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                    time.sleep(0.5)
+                    ActionChains(driver).move_to_element(el).pause(0.3).click().perform()
                     launched = True
                     break
             except Exception:
@@ -742,6 +780,44 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
             if delay > 0 and app_name != app_names[-1]:
                 print(f"  Waiting {delay} seconds before next app...")
                 time.sleep(delay)
+
+            # --- POST-CLICK DIAGNOSTICS ---
+            # Figure out why only the first app opens.
+            print(f"  [DEBUG] Current URL after click: {driver.current_url}")
+            print(f"  [DEBUG] Number of browser tabs: {len(driver.window_handles)}")
+
+            # Did clicking open a new tab? If so, switch back to the portal.
+            if len(driver.window_handles) > 1:
+                print(f"  [DEBUG] Multiple tabs detected! Handles: {driver.window_handles}")
+                print(f"  [DEBUG] Current handle: {driver.current_window_handle}")
+                # Switch back to the first (portal) tab
+                driver.switch_to.window(driver.window_handles[0])
+                print(f"  [DEBUG] Switched back to portal tab: {driver.current_url}")
+
+            # Check if any modal/overlay appeared that might block clicks
+            for overlay_sel in [
+                ".modal", ".overlay", ".dialog", "[role='dialog']",
+                ".blockUI", "#mask", ".ctx-overlay",
+            ]:
+                try:
+                    overlays = driver.find_elements(By.CSS_SELECTOR, overlay_sel)
+                    visible = [o for o in overlays if o.is_displayed()]
+                    if visible:
+                        print(f"  [DEBUG] OVERLAY DETECTED: {overlay_sel} ({len(visible)} visible)")
+                except Exception:
+                    pass
+
+            # Are the remaining app elements still in the DOM?
+            remaining = app_names[app_names.index(app_name)+1:]
+            for next_app in remaining[:1]:  # Just check the next one
+                try:
+                    check = driver.find_elements(
+                        By.XPATH, f"//img[@alt='{next_app}']/ancestor::a[1]"
+                    )
+                    check_visible = [e for e in check if e.is_displayed()]
+                    print(f"  [DEBUG] Next app '{next_app}': {len(check)} found, {len(check_visible)} visible")
+                except Exception as e:
+                    print(f"  [DEBUG] Next app '{next_app}': error checking — {e}")
         else:
             print(f"  WARNING: Could not find '{app_name}' on the portal page.")
             print(f"  Make sure the name matches exactly what you see on screen.")
