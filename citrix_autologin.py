@@ -714,12 +714,32 @@ def dismiss_post_login_screens(driver):
     #     a brief detection attempt
     #   - There may be additional screens after that
 
+    def any_visible(by, selector):
+        """True if at least one element matching the selector is VISIBLE.
+        Citrix renders the app list in the DOM behind the splash overlay,
+        so merely existing in the DOM is not enough — we must check
+        is_displayed() or we'd skip dismissing a splash that's on screen."""
+        try:
+            return any(el.is_displayed() for el in driver.find_elements(by, selector))
+        except Exception:
+            return False
+
     for attempt in range(5):
-        # If the app portal is already visible, there's nothing to dismiss —
-        # skip the settle delay entirely. This saves up to 15 seconds on
-        # deployments that go straight to the app list after login.
-        if driver.find_elements(By.CSS_SELECTOR, "#allAppsFilterBtn") or \
-           driver.find_elements(By.XPATH, "//img[contains(@class,'storeapp-icon')]"):
+        # If the app portal is actually visible on screen AND no detection
+        # splash is covering it, there's nothing to dismiss — skip the
+        # settle delay entirely. This saves up to 15 seconds on deployments
+        # that go straight to the app list after login.
+        splash_showing = any_visible(
+            By.XPATH,
+            "//*[contains(text(), 'Detect Citrix Workspace')"
+            " or contains(text(), 'Already installed')"
+            " or contains(text(), 'Welcome to Citrix Workspace')]",
+        )
+        portal_showing = (
+            any_visible(By.CSS_SELECTOR, "#allAppsFilterBtn")
+            or any_visible(By.XPATH, "//img[contains(@class,'storeapp-icon')]")
+        )
+        if portal_showing and not splash_showing:
             break
 
         time.sleep(3)  # Let the page settle between attempts
