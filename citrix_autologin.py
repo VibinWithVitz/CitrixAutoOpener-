@@ -75,8 +75,20 @@ CITRIX_APPS_TO_LAUNCH = [
 # Citrix can be slow — give it time to process each launch before the next.
 APP_LAUNCH_DELAY = 2
 
-# Seconds to wait for the portal page to fully load before looking for apps.
-PORTAL_LOAD_WAIT = 3
+# ---------------------------------------------------------------------------
+# AUTO-SHUTDOWN WHEN IDLE
+# ---------------------------------------------------------------------------
+# If you stop using your Citrix apps for this long, the script automatically
+# closes the Citrix apps, Chrome, AND its own Terminal window — so nothing
+# is left running when you walk away.
+#
+# "Using" means a Citrix window is focused and you've touched the keyboard
+# or mouse recently. Working in other apps (email, browser, etc.) counts as
+# NOT using Citrix.
+#
+# Set AUTO_SHUTDOWN_AFTER = 0 to disable this feature entirely.
+AUTO_SHUTDOWN_AFTER = 30 * 60   # 30 minutes, in seconds
+IDLE_CHECK_INTERVAL = 60        # How often (seconds) to check for activity
 
 # How we detect that login succeeded after you approve the push.
 # The script watches the URL — when it changes away from the login page,
@@ -255,15 +267,15 @@ def wait_for_push_approval(driver, timeout=PUSH_APPROVAL_TIMEOUT):
             except Exception:
                 pass
 
-        # Check if we've reached the portal
+        # Check if we've reached the portal. is_on_portal() inspects both the
+        # URL and the page DOM, so we call it once per poll and branch the
+        # message on whether the URL also changed.
         current_url = driver.current_url
-        if current_url != login_url and is_on_portal(driver):
-            print(f"\nLogin detected! Redirected to: {current_url}")
-            return True
-
-        # Also check portal elements even if URL hasn't changed much
         if is_on_portal(driver):
-            print(f"\nLogin detected! Portal elements found on: {current_url}")
+            if current_url != login_url:
+                print(f"\nLogin detected! Redirected to: {current_url}")
+            else:
+                print(f"\nLogin detected! Portal elements found on: {current_url}")
             return True
 
         # Print a status dot every 10 seconds so you know it's still running
@@ -336,6 +348,50 @@ from webdriver_manager.chrome import ChromeDriverManager
 #   2. Start a brand new login session
 
 PID_FILE = os.path.expanduser("~/CitrixAutoLogin/.pid")
+
+
+def terminate_processes(pattern):
+    """
+    Gracefully terminate every process whose command line matches `pattern`
+    (the same matching `pgrep -f` / `pkill -f` use), escalating to SIGKILL
+    for any that survive ~5 seconds.
+
+    Returns True if at least one matching process was found, False otherwise.
+    """
+    if not subprocess.run(
+        ["pgrep", "-f", pattern], capture_output=True, text=True
+    ).stdout.strip():
+        return False
+
+    # SIGTERM first (graceful)
+    subprocess.run(["pkill", "-f", pattern], capture_output=True)
+
+    # Wait up to 5 seconds for them to exit, then force-kill stragglers
+    for _ in range(10):
+        if not subprocess.run(
+            ["pgrep", "-f", pattern], capture_output=True, text=True
+        ).stdout.strip():
+            break
+        time.sleep(0.5)
+    else:
+        subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
+        time.sleep(1)
+
+    return True
+
+
+def close_citrix_apps():
+    """
+    Close any running Citrix virtual app sessions.
+
+    Citrix apps launched from the portal run inside "Citrix Viewer" processes
+    on macOS. Killing these before a fresh login prevents stale sessions from
+    lingering and ensures a clean start.
+    """
+    if terminate_processes("Citrix Viewer"):
+        print("Closed existing Citrix app sessions.")
+    else:
+        print("No existing Citrix app sessions found.")
 
 
 def kill_previous_instance():
@@ -421,6 +477,112 @@ def remove_pid_file():
         pass
 
 
+# ---------------------------------------------------------------------------
+# IDLE DETECTION (for auto-shutdown)
+# ---------------------------------------------------------------------------
+# To know whether you're "using" Citrix, we combine two macOS signals:
+#
+# 1. SYSTEM IDLE TIME — how long since the keyboard or mouse was touched,
+#    anywhere on the Mac. We read this from `ioreg`, which exposes the
+#    HIDIdleTime counter (in nanoseconds) from the input-device driver.
+#
+# 2. FRONTMOST APP — which application currently has focus. We ask
+#    System Events via AppleScript. If a Citrix window is focused AND
+#    you've been active recently, you're using Citrix.
+#
+# NOTE: The first time the frontmost-app check runs, macOS will show a
+# one-time permission prompt ("Terminal wants to control System Events").
+# Click OK. If the check is denied or fails, we fall back to system idle
+# time alone — so the feature degrades safely instead of closing your
+# apps while you're still working.
+
+
+def get_system_idle_seconds():
+    """
+    Returns seconds since the last keyboard/mouse input, system-wide.
+    Returns 0.0 if the value can't be read (treated as "active" — safe).
+    """
+    try:
+        out = subprocess.check_output(["ioreg", "-c", "IOHIDSystem"], text=True)
+        match = re.search(r'"HIDIdleTime" = (\d+)', out)
+        if match:
+            return int(match.group(1)) / 1_000_000_000  # nanoseconds → seconds
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_frontmost_app():
+    """
+    Returns the name of the currently focused application (e.g. "Citrix
+    Viewer", "Safari"), or None if it can't be determined (e.g. the
+    Automation permission was denied).
+    """
+    try:
+        return subprocess.check_output(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of first '
+             'application process whose frontmost is true'],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        ).strip() or None
+    except Exception:
+        return None
+
+
+def is_citrix_in_use():
+    """
+    Returns True if the user appears to be actively using Citrix right now:
+    recent keyboard/mouse input AND a Citrix window in focus.
+
+    If we can't tell which app is focused (permission denied), we fall back
+    to counting ANY recent input as activity — conservative, so we never
+    close apps out from under someone who's at their desk.
+    """
+    # No recent input anywhere on the Mac → definitely not in use.
+    if get_system_idle_seconds() > IDLE_CHECK_INTERVAL * 2:
+        return False
+
+    front = get_frontmost_app()
+    if front is None:
+        return True  # Can't tell what's focused — assume in use (safe)
+
+    return front in ("Citrix Viewer", "Citrix Workspace")
+
+
+def close_terminal_window():
+    """
+    Closes the Terminal window this script is running in.
+
+    We find our window by its tty (the terminal device this process is
+    attached to), then close it via AppleScript. The osascript runs as a
+    DETACHED process with a 2-second delay: by the time it fires, this
+    script has already exited, so Terminal shows "[Process completed]"
+    and closes the window without a "process still running" warning.
+    """
+    try:
+        tty = os.ttyname(sys.stdin.fileno())
+    except (OSError, ValueError):
+        return  # Not attached to a terminal (e.g. launched by a daemon)
+
+    applescript = f'''
+    tell application "Terminal"
+        repeat with w in windows
+            repeat with t in tabs of w
+                if tty of t is "{tty}" then
+                    close w saving no
+                    return
+                end if
+            end repeat
+        end repeat
+    end tell
+    '''
+    subprocess.Popen(
+        ["/bin/bash", "-c", f"sleep 2; osascript -e '{applescript}'"],
+        start_new_session=True,  # Survives this script's exit
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
 def cleanup_orphan_chrome():
     """
     Safety net: kill any Chrome processes using our profile that outlived
@@ -436,37 +598,10 @@ def cleanup_orphan_chrome():
     """
     script_profile = os.path.expanduser("~/CitrixAutoLogin/chrome-profile")
 
-    result = subprocess.run(
-        ["pgrep", "-f", f"--user-data-dir={script_profile}"],
-        capture_output=True, text=True
-    )
-    if not result.stdout.strip():
+    if not terminate_processes(f"--user-data-dir={script_profile}"):
         return  # No orphan Chrome processes — nothing to do
 
     print("Found orphan Chrome processes from a previous run — cleaning up...")
-
-    # SIGTERM first (graceful)
-    subprocess.run(
-        ["pkill", "-f", f"--user-data-dir={script_profile}"],
-        capture_output=True
-    )
-
-    # Wait up to 5 seconds for them to exit
-    for _ in range(10):
-        check = subprocess.run(
-            ["pgrep", "-f", f"--user-data-dir={script_profile}"],
-            capture_output=True, text=True
-        )
-        if not check.stdout.strip():
-            break
-        time.sleep(0.5)
-    else:
-        # Still alive — force kill
-        subprocess.run(
-            ["pkill", "-9", "-f", f"--user-data-dir={script_profile}"],
-            capture_output=True
-        )
-        time.sleep(1)
 
     # Clean up lock files so the profile can be reused
     for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
@@ -580,6 +715,13 @@ def dismiss_post_login_screens(driver):
     #   - There may be additional screens after that
 
     for attempt in range(5):
+        # If the app portal is already visible, there's nothing to dismiss —
+        # skip the settle delay entirely. This saves up to 15 seconds on
+        # deployments that go straight to the app list after login.
+        if driver.find_elements(By.CSS_SELECTOR, "#allAppsFilterBtn") or \
+           driver.find_elements(By.XPATH, "//img[contains(@class,'storeapp-icon')]"):
+            break
+
         time.sleep(3)  # Let the page settle between attempts
 
         # Priority 1: Click "Already installed" if it's visible.
@@ -666,8 +808,16 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
         print("No apps configured to launch. Edit CITRIX_APPS_TO_LAUNCH in the script.")
         return
 
-    print(f"\nWaiting {PORTAL_LOAD_WAIT} seconds for portal to fully load...")
-    time.sleep(PORTAL_LOAD_WAIT)
+    # Poll for the app list instead of sleeping a fixed amount — we proceed
+    # the moment the portal renders, and wait up to 15 seconds if it's slow.
+    print("\nWaiting for the portal app list to load...")
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: d.find_elements(By.CSS_SELECTOR, "#allAppsFilterBtn")
+            or d.find_elements(By.XPATH, "//img[contains(@class,'storeapp-icon')]")
+        )
+    except Exception:
+        print("  (App list didn't appear within 15 seconds — trying anyway)")
 
     # Click the "All Apps" tab to make sure every app is visible.
     # By default, the portal may only show a subset of apps (e.g., favorites).
@@ -700,7 +850,7 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
             pass
     print("--- End of app list ---\n")
 
-    for app_name in app_names:
+    for i, app_name in enumerate(app_names):
         print(f"\nLooking for app: '{app_name}'...")
         launched = False
 
@@ -777,47 +927,15 @@ def launch_citrix_apps(driver, app_names, delay=APP_LAUNCH_DELAY):
 
         if launched:
             print(f"  '{app_name}' launch initiated!")
-            if delay > 0 and app_name != app_names[-1]:
+
+            # Clicking an app can open a new browser tab. Switch back to the
+            # portal tab so the next app lookup searches the right page.
+            if len(driver.window_handles) > 1:
+                driver.switch_to.window(driver.window_handles[0])
+
+            if delay > 0 and i < len(app_names) - 1:
                 print(f"  Waiting {delay} seconds before next app...")
                 time.sleep(delay)
-
-            # --- POST-CLICK DIAGNOSTICS ---
-            # Figure out why only the first app opens.
-            print(f"  [DEBUG] Current URL after click: {driver.current_url}")
-            print(f"  [DEBUG] Number of browser tabs: {len(driver.window_handles)}")
-
-            # Did clicking open a new tab? If so, switch back to the portal.
-            if len(driver.window_handles) > 1:
-                print(f"  [DEBUG] Multiple tabs detected! Handles: {driver.window_handles}")
-                print(f"  [DEBUG] Current handle: {driver.current_window_handle}")
-                # Switch back to the first (portal) tab
-                driver.switch_to.window(driver.window_handles[0])
-                print(f"  [DEBUG] Switched back to portal tab: {driver.current_url}")
-
-            # Check if any modal/overlay appeared that might block clicks
-            for overlay_sel in [
-                ".modal", ".overlay", ".dialog", "[role='dialog']",
-                ".blockUI", "#mask", ".ctx-overlay",
-            ]:
-                try:
-                    overlays = driver.find_elements(By.CSS_SELECTOR, overlay_sel)
-                    visible = [o for o in overlays if o.is_displayed()]
-                    if visible:
-                        print(f"  [DEBUG] OVERLAY DETECTED: {overlay_sel} ({len(visible)} visible)")
-                except Exception:
-                    pass
-
-            # Are the remaining app elements still in the DOM?
-            remaining = app_names[app_names.index(app_name)+1:]
-            for next_app in remaining[:1]:  # Just check the next one
-                try:
-                    check = driver.find_elements(
-                        By.XPATH, f"//img[@alt='{next_app}']/ancestor::a[1]"
-                    )
-                    check_visible = [e for e in check if e.is_displayed()]
-                    print(f"  [DEBUG] Next app '{next_app}': {len(check)} found, {len(check_visible)} visible")
-                except Exception as e:
-                    print(f"  [DEBUG] Next app '{next_app}': error checking — {e}")
         else:
             print(f"  WARNING: Could not find '{app_name}' on the portal page.")
             print(f"  Make sure the name matches exactly what you see on screen.")
@@ -840,6 +958,9 @@ def login_to_citrix():
     7. Launch your configured Citrix apps from the portal
     8. Stay alive until the user presses the hotkey again (or Ctrl+C)
     """
+    # --- Close any existing Citrix app sessions ---
+    close_citrix_apps()
+
     # --- Kill any previous instance ---
     # If the user pressed the hotkey while a previous run is still going,
     # send it SIGTERM so it shuts down Chrome cleanly, then proceed.
@@ -920,14 +1041,19 @@ def login_to_citrix():
     # We use WebDriverWait here (instead of find_element) so the script
     # gives the page enough time to load before deciding the splash page
     # isn't there.
+    # We wait for EITHER the splash header OR the username field, whichever
+    # shows up first. The old approach waited a full 10 seconds for the splash
+    # before giving up — which added 10 seconds to every login that didn't
+    # have one. This way the script moves on the instant the page is ready.
+    splash_xpath = "//*[contains(text(), 'New Login Instructions')]"
     try:
         print("Checking for 'New Login Instructions' splash page...")
-        instructions_header = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((
-                By.XPATH, "//*[contains(text(), 'New Login Instructions')]"
-            ))
+        wait.until(
+            lambda d: d.find_elements(By.XPATH, splash_xpath)
+            or d.find_elements(By.CSS_SELECTOR, USERNAME_SELECTOR)
         )
-        if instructions_header.is_displayed():
+        splash = driver.find_elements(By.XPATH, splash_xpath)
+        if splash and splash[0].is_displayed():
             print("Found splash page — waiting for Continue button...")
             continue_btn = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "#loginBtn"))
@@ -940,6 +1066,8 @@ def login_to_citrix():
                 EC.presence_of_element_located((By.CSS_SELECTOR, USERNAME_SELECTOR))
             )
             print("Login page loaded.")
+        else:
+            print("No splash page found — proceeding to login.")
     except Exception:
         print("No splash page found — proceeding to login.")
 
@@ -997,23 +1125,44 @@ def login_to_citrix():
         # Now that we're past all splash screens, find and click on each app.
         launch_citrix_apps(driver, CITRIX_APPS_TO_LAUNCH)
 
-    # --- Stay alive so Chrome stays open ---
+    # --- Stay alive so Chrome stays open (and watch for idleness) ---
     # The script keeps running in the background. Chrome stays open for the
     # user to work with their Citrix apps. The script will exit cleanly when:
     #   - The user presses the hotkey again (Ctrl+Shift+C) → new instance
     #     sends SIGTERM → signal handler calls driver.quit()
     #   - The user presses Ctrl+C in Terminal → SIGINT → same clean shutdown
     #   - The user closes the Terminal window → SIGHUP → same clean shutdown
+    #   - AUTO-SHUTDOWN: the user hasn't used Citrix for AUTO_SHUTDOWN_AFTER
+    #     seconds → close Citrix apps, Chrome, and this Terminal window
     print("\nDone! Chrome will stay open so you can use your Citrix apps.")
     print("Press Ctrl+Shift+C again (or Ctrl+C) to close Chrome and exit.")
+    if AUTO_SHUTDOWN_AFTER > 0:
+        print(f"Auto-shutdown: everything closes after "
+              f"{AUTO_SHUTDOWN_AFTER // 60} minutes of inactivity.")
     print("Thank you for using the Citrix Auto Opener!")
 
+    idle_shutdown = False
     try:
-        # Sleep in a loop — the signal handlers will interrupt this when
-        # it's time to shut down. We use short sleeps so the process
-        # remains responsive to signals.
+        # Watch for activity in a loop — the signal handlers will interrupt
+        # the sleep when it's time to shut down for other reasons.
+        #
+        # The idle clock (last_active) resets every time we see the user
+        # actively using Citrix. If it runs past AUTO_SHUTDOWN_AFTER without
+        # a reset, we tear everything down.
+        last_active = time.time()
         while True:
-            time.sleep(1)
+            time.sleep(IDLE_CHECK_INTERVAL if AUTO_SHUTDOWN_AFTER > 0 else 1)
+            if AUTO_SHUTDOWN_AFTER <= 0:
+                continue  # Feature disabled — just stay alive
+
+            if is_citrix_in_use():
+                last_active = time.time()
+            elif time.time() - last_active >= AUTO_SHUTDOWN_AFTER:
+                idle_minutes = int((time.time() - last_active) / 60)
+                print(f"\nNo Citrix activity for {idle_minutes} minutes — "
+                      "shutting everything down...")
+                idle_shutdown = True
+                break
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -1024,6 +1173,12 @@ def login_to_citrix():
         except Exception:
             pass
         remove_pid_file()
+        if idle_shutdown:
+            # Close the Citrix app sessions and our own Terminal window.
+            # (Only on idle shutdown — a hotkey restart or Ctrl+C keeps the
+            # window open so you can see what happened.)
+            close_citrix_apps()
+            close_terminal_window()
 
 
 # ---------------------------------------------------------------------------
